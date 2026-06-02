@@ -399,3 +399,127 @@ class TestParseAffineSetLowering:
     def test_non_box_stays_affine_set(self):
         s = parse_affine_set("affine_set<(d0, d1) : (d1 - d0 >= 0)>")
         assert isinstance(s, AffineSet)
+
+
+# ===========================================================================
+# Symbolic BoxSet — lowering, ops, and specialize round-trip
+# ===========================================================================
+
+class TestSymbolicBoxSet:
+    """Symbolic ``BoxSet`` lifted from ``n_syms > 0`` AffineSets.
+
+    Validates the full chain: parse-time lowering preserves the symbolic
+    bound, per-axis ops accept ``symbols``, ``specialize`` yields a
+    fully-concrete box, and the symbol-resolved set agrees pointwise
+    with the AffineSet slow path on the same input.
+    """
+
+    def test_lowering_preserves_bounds_via_parse(self):
+        # ``-d0 + s0 - 1 >= 0``  →  d0 < s0  →  hi[0] is symbolic in s0.
+        s = parse_affine_set("affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>")
+        assert isinstance(s, BoxSet)
+        # Concrete lo on the same axis stays a plain int (no AST allocation).
+        assert s.lo == (0,)
+        assert not s._all_concrete
+
+    def test_specialize_resolves_to_concrete_box(self):
+        s = parse_affine_set("affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>")
+        for n in (1, 16, 1024):
+            spec = s.specialize([n])
+            assert spec._all_concrete
+            assert spec == BoxSet(lo=(0,), hi=(n,))
+
+    def test_query_methods_accept_symbols(self):
+        # Cross-check BoxSet symbolic answers against the equivalent
+        # slow-path AffineSet so the expectation comes from the IR
+        # rather than a hand-coded constant.
+        from ktir_cpu.parser_ast import parse_affine_set_raw
+        src = "affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>"
+        box = parse_affine_set(src)
+        aset = parse_affine_set_raw(src)
+        assert isinstance(box, BoxSet)
+        for n in (1, 8):
+            for pt in [(0,), (n - 1,), (n,), (-1,)]:
+                assert box.contains(pt, symbols=[n]) == aset.contains(pt, symbols=[n])
+            assert box.is_empty(symbols=[n]) is False
+            assert box.is_full((n,), symbols=[n]) is True
+            assert box.enumerate((n,), symbols=[n]) == [(i,) for i in range(n)]
+        # Empty extent: s0 = 0 collapses hi to lo.
+        assert box.is_empty(symbols=[0]) is True
+
+    def test_intersect_specialized_then_concrete(self):
+        # Symbolic lo on d0, concrete elsewhere.  After specialize, the
+        # axis-wise intersect should fall to plain ints.
+        sym = parse_affine_set(
+            "affine_set<(d0)[s0] : (d0 - s0 >= 0, -d0 + 1023 >= 0)>"
+        )
+        concrete = BoxSet(lo=(0,), hi=(8,))
+        spec = sym.specialize([3])  # lo=(3,), hi=(1024,)
+        out = spec.intersect(concrete)
+        assert out == BoxSet(lo=(3,), hi=(8,))
+        assert out._all_concrete
+
+    def test_translate_concrete_offset_preserves_symbols(self):
+        # Translating a symbolic box by a concrete offset retains the
+        # AST shape on the symbolic side; concrete sides fold.
+        s = parse_affine_set("affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>")
+        shifted = s.translate([5])
+        # Concrete side folds to a plain int; symbolic side stays as an
+        # AST tuple (not ``int``) and still resolves against ``symbols``
+        # after translation.
+        assert eval_bound_eq(shifted.lo[0], (), 5)
+        assert isinstance(shifted.hi[0], tuple), (
+            f"hi[0] should remain an AST tuple after translate, "
+            f"got {type(shifted.hi[0]).__name__}: {shifted.hi[0]!r}"
+        )
+        for n in (8, 64):
+            # Per-symbol resolution: hi specialises to 5 + n.
+            assert eval_bound_eq(shifted.hi[0], (n,), 5 + n)
+            assert shifted.specialize([n]) == BoxSet(lo=(5,), hi=(5 + n,))
+
+    def test_reject_multi_dim_with_symbol(self):
+        # Symbol mixed with two dims in one constraint — not separable
+        # into a single-axis bound, even though every term is linear.
+        from ktir_cpu.parser_ast import parse_affine_set_raw
+        aset = parse_affine_set_raw(
+            "affine_set<(d0, d1)[s0] : (d0 + d1 - s0 >= 0, -d0 + 3 >= 0, -d1 + 3 >= 0)>"
+        )
+        assert BoxSet.try_from_affine_set(aset) is None
+
+    def test_reject_nonunit_coefficient_with_symbol(self):
+        # ``2 * d0 + s0 >= 0`` — non-±1 dim coefficient on the symbolic
+        # path mirrors the all-concrete reject (guard symmetry).
+        from ktir_cpu.parser_ast import parse_affine_set_raw
+        aset = parse_affine_set_raw(
+            "affine_set<(d0)[s0] : (2 * d0 + s0 >= 0, -d0 + 3 >= 0)>"
+        )
+        assert BoxSet.try_from_affine_set(aset) is None
+
+    def test_negative_symbol_coefficient_in_bound(self):
+        # ``d0 - s0 >= 0``  →  d0 >= s0  →  lo[0] depends on +s0; the
+        # symmetric upper-bound case ``-d0 + s0 - 1 >= 0`` already
+        # exercises the +s0 path.  This case forces ``_build_sym_term``
+        # to emit a negated symbol term in lo[0] (`("neg", ("sym", 0))`
+        # via ``sym_neg``) instead of a bare ``("sym", 0)`` reference.
+        s = parse_affine_set(
+            "affine_set<(d0)[s0] : (d0 - s0 >= 0, -d0 + 1023 >= 0)>"
+        )
+        assert isinstance(s, BoxSet)
+        assert s.hi == (1024,)                     # concrete fold
+        assert isinstance(s.lo[0], tuple)          # symbolic AST retained
+        # Cross-check against the AffineSet slow path on equivalent input.
+        from ktir_cpu.parser_ast import parse_affine_set_raw
+        aset = parse_affine_set_raw(
+            "affine_set<(d0)[s0] : (d0 - s0 >= 0, -d0 + 1023 >= 0)>"
+        )
+        for n in (0, 3, 1023):
+            spec = s.specialize([n])
+            assert spec == BoxSet(lo=(n,), hi=(1024,))
+            for pt in [(n - 1,), (n,), (n + 1,), (1022,), (1023,)]:
+                assert s.contains(pt, symbols=[n]) == aset.contains(pt, symbols=[n])
+
+
+def eval_bound_eq(b, symbols, expected):
+    """Helper: evaluate a Bound and assert it matches *expected*."""
+    from ktir_cpu.parser_ast import eval_bound
+    return eval_bound(b, symbols) == expected
