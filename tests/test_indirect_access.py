@@ -73,9 +73,9 @@ SMALL_INDIRECT_MLIR = """
 module {
   func.func @small_indirect_gather() attributes {grid = [1, 1]} {
     %X_addr    = arith.constant 0 : index
-    %IDX1_addr = arith.constant 1 : index
-    %IDX2_addr = arith.constant 2 : index
-    %Y_addr    = arith.constant 3 : index
+    %IDX1_addr = arith.constant 32 : index
+    %IDX2_addr = arith.constant 64 : index
+    %Y_addr    = arith.constant 192 : index
 
     %X = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {
         coordinate_set = #coord_set_4x4,
@@ -168,7 +168,7 @@ _SSA_NONZERO_RANGE_MLIR = """
 module {
   func.func @bad_indirect() attributes {grid = [1, 1]} {
     %X_addr   = arith.constant 0   : index
-    %IDX_addr = arith.constant 64  : index
+    %IDX_addr = arith.constant 2048 : index
     %c2       = arith.constant 2   : index
 
     %X = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {
@@ -200,7 +200,7 @@ _SSA_ZERO_RANGE_MLIR = """
 module {
   func.func @ok_indirect() attributes {grid = [1, 1]} {
     %X_addr   = arith.constant 0   : index
-    %IDX_addr = arith.constant 64  : index
+    %IDX_addr = arith.constant 2048 : index
     %c2       = arith.constant 2   : index
 
     %X = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {
@@ -322,9 +322,9 @@ SMALL_INDIRECT_SCATTER_MLIR = """
 module {
   func.func @small_indirect_scatter() attributes {grid = [1, 1]} {
     %X_addr    = arith.constant 0 : index
-    %IDX1_addr = arith.constant 1 : index
-    %IDX2_addr = arith.constant 2 : index
-    %Y_addr    = arith.constant 3 : index
+    %IDX1_addr = arith.constant 32 : index
+    %IDX2_addr = arith.constant 64 : index
+    %Y_addr    = arith.constant 192 : index
 
     %X_view = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {
         coordinate_set = #coord_set_4x4,
@@ -491,9 +491,9 @@ def _gather_vso_mlir_4x4(vso_str: str, func_name: str) -> str:
 module {{
   func.func @{func_name}() attributes {{grid = [1, 1]}} {{
     %X_addr    = arith.constant 0 : index
-    %IDX1_addr = arith.constant 1 : index
-    %IDX2_addr = arith.constant 2 : index
-    %Y_addr    = arith.constant 3 : index
+    %IDX1_addr = arith.constant 32 : index
+    %IDX2_addr = arith.constant 64 : index
+    %Y_addr    = arith.constant 192 : index
 
     %X = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {{
         coordinate_set = #coord_set_4x4,
@@ -547,9 +547,9 @@ def _scatter_vso_mlir_4x4(vso_str: str, func_name: str) -> str:
 module {{
   func.func @{func_name}() attributes {{grid = [1, 1]}} {{
     %X_addr    = arith.constant 0 : index
-    %IDX1_addr = arith.constant 1 : index
-    %IDX2_addr = arith.constant 2 : index
-    %Y_addr    = arith.constant 3 : index
+    %IDX1_addr = arith.constant 32 : index
+    %IDX2_addr = arith.constant 64 : index
+    %Y_addr    = arith.constant 192 : index
 
     %X_view = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {{
         coordinate_set = #coord_set_4x4,
@@ -655,8 +655,8 @@ _SMALL_3D_INDIRECT_GATHER_3CYCLE_MLIR = """
 module {
   func.func @small_3d_indirect_gather_3cycle() attributes {grid = [1, 1]} {
     %X_addr   = arith.constant 0 : index
-    %IDX_addr = arith.constant 1 : index
-    %Y_addr   = arith.constant 2 : index
+    %IDX_addr = arith.constant 32 : index
+    %Y_addr   = arith.constant 128 : index
 
     %X = ktdp.construct_memory_view %X_addr, sizes: [2, 2, 2], strides: [4, 2, 1] {
         coordinate_set = #coord_set_2x2x2,
@@ -745,8 +745,8 @@ _SMALL_3D_INDIRECT_SCATTER_3CYCLE_MLIR = """
 module {
   func.func @small_3d_indirect_scatter_3cycle() attributes {grid = [1, 1]} {
     %X_addr   = arith.constant 0 : index
-    %IDX_addr = arith.constant 1 : index
-    %Y_addr   = arith.constant 2 : index
+    %IDX_addr = arith.constant 32 : index
+    %Y_addr   = arith.constant 128 : index
 
     %X_view = ktdp.construct_memory_view %X_addr, sizes: [2, 2, 2], strides: [4, 2, 1] {
         coordinate_set = #coord_set_2x2x2,
@@ -970,7 +970,7 @@ _COMPOUND_FLOORDIV_MOD_MLIR = """
 module {
   func.func @compound_floordiv_mod() attributes {grid = [1, 1]} {
     %src_addr = arith.constant 0 : index
-    %dst_addr = arith.constant 100 : index
+    %dst_addr = arith.constant 6400 : index
 
     %src = ktdp.construct_memory_view %src_addr, sizes: [128], strides: [1] {
         coordinate_set = #src_set,

@@ -22,6 +22,7 @@ import pytest
 from pathlib import Path
 
 from ktir_cpu import KTIRInterpreter, HardwareConfig, LatencyReport
+from ktir_cpu.dtypes import stick_to_elem_idx
 
 from conftest import EXAMPLES_DIR, get_test_params, parse_example
 
@@ -117,7 +118,7 @@ def _run_ring_reduce(path, func_name, entry, cfg, trace=False):
     """Run ring_reduce on its 4-core grid and return ``(report, rows, n_cols)``.
 
     Differs from the other ``_run_*`` helpers because ``ring_reduce.mlir``
-    takes raw stick-index pointers (``in_ptr`` / ``out_ptr``) rather than
+    takes f16 element-index pointers (``in_ptr`` / ``out_ptr``) rather than
     ndarray kwargs.  We patch ``_prepare_execution`` to seed the input
     rows after HBM allocation; this mirrors
     ``test_examples.py::TestRingReduceExecution::test_ring_reduce_sum``.
@@ -130,6 +131,11 @@ def _run_ring_reduce(path, func_name, entry, cfg, trace=False):
     in_ptr = entry["execute_kwargs"]["in_ptr"]
     out_ptr = entry["execute_kwargs"]["out_ptr"]
 
+    # hbm.write/read take stick indices; convert from element indices.
+    _elems_per_stick = 64  # 128 bytes / 2 bytes per f16
+    in_stick  = in_ptr  // _elems_per_stick
+    out_stick = out_ptr // _elems_per_stick
+
     rng = np.random.default_rng(42)
     rows = rng.uniform(1.0, 2.0, size=(num_cores, n_cols)).astype(np.float16)
 
@@ -140,8 +146,8 @@ def _run_ring_reduce(path, func_name, entry, cfg, trace=False):
 
     def _prepare_and_seed(grid_shape):
         _orig(grid_shape)
-        interp.memory.hbm.write(in_ptr,  rows.flatten())
-        interp.memory.hbm.write(out_ptr, np.zeros(n_cols, dtype=np.float16))
+        interp.memory.hbm.write(in_stick,  rows.flatten())
+        interp.memory.hbm.write(out_stick, np.zeros(n_cols, dtype=np.float16))
 
     interp._prepare_execution = _prepare_and_seed
     interp.execute_function(func_name, **entry["execute_kwargs"])
@@ -165,6 +171,11 @@ def _run_ring_reduce_multi_group(path, func_name, entry, cfg, trace=False):
     in_ptr = entry["execute_kwargs"]["in_ptr"]
     out_ptr = entry["execute_kwargs"]["out_ptr"]
 
+    # hbm.write/read take stick indices; convert from element indices.
+    _elems_per_stick = 64  # 128 bytes / 2 bytes per f16
+    in_stick  = in_ptr  // _elems_per_stick
+    out_stick = out_ptr // _elems_per_stick
+
     rng = np.random.default_rng(42)
     rows = rng.uniform(1.0, 2.0, size=(num_cores, n_cols)).astype(np.float16)
 
@@ -175,8 +186,8 @@ def _run_ring_reduce_multi_group(path, func_name, entry, cfg, trace=False):
 
     def _prepare_and_seed(grid_shape):
         _orig(grid_shape)
-        interp.memory.hbm.write(in_ptr,  rows.flatten())
-        interp.memory.hbm.write(out_ptr, np.zeros(n_groups * n_cols, dtype=np.float16))
+        interp.memory.hbm.write(in_stick,  rows.flatten())
+        interp.memory.hbm.write(out_stick, np.zeros(n_groups * n_cols, dtype=np.float16))
 
     interp._prepare_execution = _prepare_and_seed
     interp.execute_function(func_name, **entry["execute_kwargs"])
@@ -186,7 +197,7 @@ def _run_ring_reduce_multi_group(path, func_name, entry, cfg, trace=False):
         n_cols,
         n_groups,
         group_size,
-        interp.memory.hbm.read(out_ptr, n_groups * n_cols, "f16").reshape(n_groups, n_cols),
+        interp.memory.hbm.read(out_stick, n_groups * n_cols, "f16").reshape(n_groups, n_cols),
     )
 
 
@@ -1742,10 +1753,10 @@ class TestIndirectAccessLatency:
         lx = LXScratchpad(core_id=0)
         ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0), lx=lx, hbm=HBMSimulator())
 
-        parent_ptr = 0
-        idx_ptr = 64  # past parent's 8 f16 = 16 bytes; safe non-overlap
-        lx.write(parent_ptr, np.zeros(8, dtype=np.float16))  # seed for read-modify-write
-        lx.write(idx_ptr, np.arange(4, dtype=np.int32))
+        parent_ptr = 0   # element index 0 → byte 0 (f16)
+        idx_ptr = 16     # element index 16 → byte 64 (i32, 4 bytes); past parent's 8 f16 = 16 bytes
+        lx.write(parent_ptr * 2, np.zeros(8, dtype=np.float16))   # seed at byte 0
+        lx.write(idx_ptr * 4, np.arange(4, dtype=np.int32))       # seed at byte 64
 
         parent_ref = MemRef(
             base_ptr=parent_ptr, shape=(8,), strides=[1],
@@ -1844,11 +1855,11 @@ class TestIndirectAccessLatency:
         hbm.write(idx1_stick, np.zeros(64, dtype=np.int32))
         hbm.write(idx2_stick, np.zeros(64, dtype=np.int32))
 
-        parent = MemRef(base_ptr=x_stick, shape=(8, 8), strides=[8, 1],
+        parent = MemRef(base_ptr=stick_to_elem_idx(x_stick, "f16"), shape=(8, 8), strides=[8, 1],
                         memory_space="HBM", dtype="f16")
-        idx1 = MemRef(base_ptr=idx1_stick, shape=(8, 8), strides=[8, 1],
+        idx1 = MemRef(base_ptr=stick_to_elem_idx(idx1_stick, "i32"), shape=(8, 8), strides=[8, 1],
                       memory_space="HBM", dtype="i32")
-        idx2 = MemRef(base_ptr=idx2_stick, shape=(8, 8), strides=[8, 1],
+        idx2 = MemRef(base_ptr=stick_to_elem_idx(idx2_stick, "i32"), shape=(8, 8), strides=[8, 1],
                       memory_space="HBM", dtype="i32")
 
         iat = IndirectAccessTile(
