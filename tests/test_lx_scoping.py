@@ -22,16 +22,148 @@ import numpy as np
 import pytest
 
 from ktir_cpu.grid import CoreContext
-from ktir_cpu.memory import LXScratchpad, HBMSimulator
+from ktir_cpu.memory import LXOptions, LXScratchpad, HBMSimulator
 from ktir_cpu.ir_types import Tile
 from ktir_cpu.ops.memory_ops import MemoryOps
 
+# ---------------------------------------------------------------------------
+# LXOptions presets used throughout
+# ---------------------------------------------------------------------------
 
-def _make_context(lx_size_mb: int = 2) -> CoreContext:
+_LX_BASELINE = LXOptions(alias_dedup=False, consume_last_use=False)
+_LX_DEDUP    = LXOptions(alias_dedup=True,  consume_last_use=False)
+_LX_FULL     = LXOptions(alias_dedup=True,  consume_last_use=True)
+
+# ---------------------------------------------------------------------------
+# MLIR kernels used by parse-level and end-to-end tests
+# ---------------------------------------------------------------------------
+
+# Small 8×8 matmul — used by TestUseCountsParsed to verify _build_use_counts.
+MATMUL_UC_MLIR = """
+module {
+  func.func @matmul_uc_test(
+      %a_ptr: index, %b_ptr: index, %c_ptr: index, %K: index,
+      %BM: index, %BN: index, %BK: index
+  ) attributes {grid = [1]} {
+    %pid_m, %pid_n = ktdp.get_compute_tile_id : index, index
+    %a_view = ktdp.construct_memory_view %a_ptr, sizes: [8, 8], strides: [8, 1] {
+      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 7 >= 0, d1 >= 0, -d1 + 7 >= 0)>,
+      memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<8x8xf16>
+    %b_view = ktdp.construct_memory_view %b_ptr, sizes: [8, 8], strides: [8, 1] {
+      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 7 >= 0, d1 >= 0, -d1 + 7 >= 0)>,
+      memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<8x8xf16>
+    %c_view = ktdp.construct_memory_view %c_ptr, sizes: [8, 8], strides: [8, 1] {
+      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 7 >= 0, d1 >= 0, -d1 + 7 >= 0)>,
+      memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<8x8xf16>
+    %c0 = arith.constant 0 : index
+    %accum_zero = arith.constant dense<0.0> : tensor<8x8xf16>
+    %c = scf.for %off_k = %c0 to %K step %BK iter_args(%accum_itr = %accum_zero) -> (tensor<8x8xf16>) {
+      %a_acc = ktdp.construct_access_tile %a_view[%pid_m, %off_k] {
+        access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 7 >= 0, d1 >= 0, -d1 + 7 >= 0)>,
+        access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+      } : memref<8x8xf16> -> !ktdp.access_tile<8x8xindex>
+      %b_acc = ktdp.construct_access_tile %b_view[%off_k, %pid_n] {
+        access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 7 >= 0, d1 >= 0, -d1 + 7 >= 0)>,
+        access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+      } : memref<8x8xf16> -> !ktdp.access_tile<8x8xindex>
+      %a = ktdp.load %a_acc : !ktdp.access_tile<8x8xindex> -> tensor<8x8xf16>
+      %b = ktdp.load %b_acc : !ktdp.access_tile<8x8xindex> -> tensor<8x8xf16>
+      %c_init = tensor.empty() : tensor<8x8xf16>
+      %a_dot_b = linalg.matmul ins(%a, %b : tensor<8x8xf16>, tensor<8x8xf16>)
+                               outs(%c_init : tensor<8x8xf16>) -> tensor<8x8xf16>
+      %accum_next = arith.addf %accum_itr, %a_dot_b : tensor<8x8xf16>
+      scf.yield %accum_next : tensor<8x8xf16>
+    }
+    %c_acc = ktdp.construct_access_tile %c_view[%pid_m, %pid_n] {
+        access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 7 >= 0, d1 >= 0, -d1 + 7 >= 0)>,
+        access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+      } : memref<8x8xf16> -> !ktdp.access_tile<8x8xindex>
+    ktdp.store %c, %c_acc : tensor<8x8xf16>, !ktdp.access_tile<8x8xindex>
+    return
+  }
+}
+"""
+
+# Large-tile matmul — used by TestLastUseMatmulKernel end-to-end test.
+# BM=512, BN=256, BK=64: accumulator tile = 512*256*2 = 262144 bytes (256 KB).
+# Peak live set with _LX_BASELINE exceeds 1 MB; with _LX_FULL it fits.
+MATMUL_LX_MLIR = """
+module {
+  func.func @matmul_lx_test(
+      %a_ptr: index,
+      %b_ptr: index,
+      %c_ptr: index,
+      %K: index,
+      %BM: index,
+      %BN: index,
+      %BK: index
+  ) attributes {grid = [1]} {
+    %pid_m, %pid_n = ktdp.get_compute_tile_id : index, index
+
+    %a_view = ktdp.construct_memory_view %a_ptr, sizes: [512, 256], strides: [256, 1] {
+      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 511 >= 0, d1 >= 0, -d1 + 255 >= 0)>,
+      memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<512x256xf16>
+
+    %b_view = ktdp.construct_memory_view %b_ptr, sizes: [256, 256], strides: [256, 1] {
+      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 255 >= 0, d1 >= 0, -d1 + 255 >= 0)>,
+      memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<256x256xf16>
+
+    %c_view = ktdp.construct_memory_view %c_ptr, sizes: [512, 256], strides: [256, 1] {
+      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 511 >= 0, d1 >= 0, -d1 + 255 >= 0)>,
+      memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<512x256xf16>
+
+    %c0 = arith.constant 0 : index
+    %accum_zero = arith.constant dense<0.0> : tensor<512x256xf16>
+
+    %c = scf.for %off_k = %c0 to %K step %BK iter_args(%accum_itr = %accum_zero) -> (tensor<512x256xf16>) {
+
+      %a_acc = ktdp.construct_access_tile %a_view[%pid_m, %off_k] {
+        access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 511 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
+        access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+      } : memref<512x256xf16> -> !ktdp.access_tile<512x64xindex>
+
+      %b_acc = ktdp.construct_access_tile %b_view[%off_k, %pid_n] {
+        access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 255 >= 0)>,
+        access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+      } : memref<256x256xf16> -> !ktdp.access_tile<64x256xindex>
+
+      %a = ktdp.load %a_acc : !ktdp.access_tile<512x64xindex> -> tensor<512x64xf16>
+      %b = ktdp.load %b_acc : !ktdp.access_tile<64x256xindex> -> tensor<64x256xf16>
+
+      %c_init = tensor.empty() : tensor<512x256xf16>
+      %a_dot_b = linalg.matmul ins(%a, %b : tensor<512x64xf16>, tensor<64x256xf16>)
+                               outs(%c_init : tensor<512x256xf16>) -> tensor<512x256xf16>
+
+      %accum_next = arith.addf %accum_itr, %a_dot_b : tensor<512x256xf16>
+
+      scf.yield %accum_next : tensor<512x256xf16>
+    }
+
+    %c_acc = ktdp.construct_access_tile %c_view[%pid_m, %pid_n] {
+        access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 511 >= 0, d1 >= 0, -d1 + 255 >= 0)>,
+        access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+      } : memref<512x256xf16> -> !ktdp.access_tile<512x256xindex>
+
+    ktdp.store %c, %c_acc : tensor<512x256xf16>, !ktdp.access_tile<512x256xindex>
+
+    return
+  }
+}
+"""
+
+
+def _make_context(lx_size_mb: int = 2, lx_options: LXOptions = None) -> CoreContext:
     """Create a CoreContext with a fresh LX scratchpad and HBM."""
     lx = LXScratchpad(size_mb=lx_size_mb, core_id=0)
     hbm = HBMSimulator()
-    return CoreContext(core_id=0, grid_pos=(0, 0, 0), lx=lx, hbm=hbm)
+    return CoreContext(core_id=0, grid_pos=(0, 0, 0), lx=lx, hbm=hbm,
+                       lx_options=lx_options if lx_options is not None else _LX_FULL)
 
 
 def _make_tile(shape: tuple, dtype: str = "f16") -> Tile:
@@ -111,7 +243,24 @@ class TestScopeStack:
 # ---------------------------------------------------------------------------
 
 class TestLXTracking:
-    """Test that set_value auto-tracking correctly manages lx.used."""
+    """set_value auto-tracking: every Tile binding charges lx.used exactly once.
+
+    Tile size used in alias tests: tensor<32x1024xf16> = 32*1024*2 = 65536 bytes.
+
+    Alias dedup (_LX_DEDUP vs _LX_BASELINE)
+    ----------------------------------------
+    Two SSA names can point to the same Python Tile object (e.g. linalg.reduce
+    binds %result and %outs to the same buffer).  Without dedup, each binding
+    charges separately:
+
+      _LX_BASELINE — no id() tracking:
+        set_value("%a", tile)  →  lx.used = 65536   (charged)
+        set_value("%b", tile)  →  lx.used = 131072  (charged again — wrong)
+
+      _LX_DEDUP — refcount by id():
+        set_value("%a", tile)  →  lx.used = 65536   (first binding, charged)
+        set_value("%b", tile)  →  lx.used = 65536   (same id(), refcount 1→2, no charge)
+    """
 
     def test_set_value_tile_increments_used(self):
         ctx = _make_context()
@@ -127,13 +276,21 @@ class TestLXTracking:
         ctx.set_value("%tile", 0)  # overwrite with a non-Tile — refcount drops to 0
         assert ctx.lx.used == 0
 
-    def test_alias_does_not_double_count(self):
-        """Two names bound to the same Tile object charge LX only once."""
-        ctx = _make_context()
-        tile = _make_tile((32, 1024))
+    def test_alias_charges_once_with_dedup(self):
+        """With alias_dedup, two names for the same Tile charge LX once (N)."""
+        ctx = _make_context(lx_options=_LX_DEDUP)
+        tile = _make_tile((32, 1024))  # 65536 bytes
         ctx.set_value("%a", tile)
-        ctx.set_value("%b", tile)  # alias — same id(tile)
+        ctx.set_value("%b", tile)  # same id(tile)
         assert ctx.lx.used == 65536
+
+    def test_alias_double_charges_without_dedup(self):
+        """Without alias_dedup, two names for the same Tile charge LX twice (2N)."""
+        ctx = _make_context(lx_options=_LX_BASELINE)
+        tile = _make_tile((32, 1024))  # 65536 bytes
+        ctx.set_value("%a", tile)
+        ctx.set_value("%b", tile)
+        assert ctx.lx.used == 65536 * 2
 
     def test_pop_scope_frees_lx(self):
         """Popping a scope frees LX for all Tiles defined in that scope."""
@@ -636,7 +793,7 @@ class TestNextPtrRewind:
     pop_scope so it stays in lockstep with lx.used.
     """
 
-    def test_issue_26_reproducer_next_ptr_bounded_in_loop(self):
+    def test_next_ptr_returns_to_zero_each_iteration(self):
         """The exact failure mode from issue #26.
 
         Before the fix, next_ptr advanced by 2048 (tile size, stick-aligned)
@@ -743,3 +900,296 @@ class TestNextPtrRewind:
         assert ctx._lx_next_ptr_stack == []
         assert ctx.lx.next_ptr == 0
         assert ctx.lx.used == 0
+
+
+# ---------------------------------------------------------------------------
+# Consume-on-last-use
+# ---------------------------------------------------------------------------
+
+class TestConsumeOnLastUse:
+    """consume_last_use: free a Tile at its last fetch instead of at scope exit.
+
+    Motivating pattern — a binary op where both inputs are single-use:
+
+        %a = ktdp.load ...          # tensor<16x16xf16> = 512 bytes
+        %b = ktdp.load ...          # tensor<16x16xf16> = 512 bytes
+        %r = arith.addf %a, %b     # handler fetches %a then %b, then registers %r
+
+    Without consume_last_use (_LX_DEDUP):
+        after set_value("%a"):       lx.used = 512
+        after set_value("%b"):       lx.used = 1024
+        get_value("%a") — no free:   lx.used = 1024
+        get_value("%b") — no free:   lx.used = 1024
+        set_value("%r", result):     lx.used = 1536   ← all three live simultaneously
+
+    With consume_last_use (_LX_FULL), use_counts = {%a:1, %b:1}:
+        after set_value("%a"):       lx.used = 512
+        after set_value("%b"):       lx.used = 1024
+        get_value("%a") — freed:     lx.used =  512   ← %a gone before handler returns
+        get_value("%b") — freed:     lx.used =    0   ← %b gone before result lands
+        set_value("%r", result):     lx.used =  512   ← net: replaced two inputs with one output
+
+    Guard: only the topmost scope is eligible for early-free.  An outer-scope
+    name with use_count==1 that is read N times inside a loop is NOT consumed
+    on first fetch — the topmost-scope check (scope is _scope_stack[-1]) blocks it.
+    """
+
+    def test_single_use_tile_lx_used(self):
+        """Single-use tile: with consume on, LX is freed at fetch; with consume off, it stays."""
+        tile = _make_tile((32, 64))  # 4096 bytes
+
+        ctx_off = _make_context(lx_options=_LX_DEDUP)
+        ctx_off.set_value("%a", tile)
+        ctx_off._use_counts = {"%a": 1}
+        ctx_off.get_value("%a")
+        assert ctx_off.lx.used == 4096  # still held — consume off
+        assert ctx_off.has_value("%a")
+
+        ctx_on = _make_context(lx_options=_LX_FULL)
+        ctx_on.set_value("%a", tile)
+        ctx_on._use_counts = {"%a": 1}
+        ctx_on.get_value("%a")
+        assert ctx_on.lx.used == 0     # freed at fetch — consume on
+        assert not ctx_on.has_value("%a")
+
+    def test_peek_does_not_consume(self):
+        """peek=True reads without consuming; subsequent normal get_value still consumes.
+
+        Sequence:
+            set_value("%a", tile)    lx.used = 512
+            get_value("%a", peek=T)  lx.used = 512  — no consume, tile still in scope
+            get_value("%a")          lx.used = 0    — consume fires here, not earlier
+        """
+        tile = _make_tile((16, 16))  # 512 bytes
+
+        ctx = _make_context(lx_options=_LX_FULL)
+        ctx.set_value("%a", tile)
+        ctx._use_counts = {"%a": 1}
+
+        result = ctx.get_value("%a", peek=True)
+        assert result is tile
+        assert ctx.lx.used == 512        # peek did not free
+        assert ctx.has_value("%a")       # still in scope
+
+        result2 = ctx.get_value("%a")
+        assert result2 is tile
+        assert ctx.lx.used == 0          # consumed on normal fetch
+        assert not ctx.has_value("%a")
+
+    def test_multi_use_tile_not_consumed(self):
+        """Multi-use tile (count > 1) is never consumed regardless of consume_last_use."""
+        tile = _make_tile((32, 64))  # 4096 bytes
+
+        for opts in (_LX_DEDUP, _LX_FULL):
+            ctx = _make_context(lx_options=opts)
+            ctx.set_value("%a", tile)
+            ctx._use_counts = {"%a": 2}
+            ctx.get_value("%a")
+            assert ctx.lx.used == 4096
+            assert ctx.has_value("%a")
+
+    def test_non_tile_not_consumed(self):
+        """Scalars are never consumed regardless of use_count."""
+        for opts in (_LX_DEDUP, _LX_FULL):
+            ctx = _make_context(lx_options=opts)
+            ctx.set_value("%s", 42)
+            ctx._use_counts = {"%s": 1}
+            assert ctx.get_value("%s") == 42
+            assert ctx.has_value("%s")
+
+    def test_net_zero_with_consume_on(self):
+        """With consume on: fetch two single-use tiles (lx → 0), register result (lx = N)."""
+        ctx = _make_context(lx_options=_LX_FULL)
+        tile_a = _make_tile((16, 16))  # 512 bytes
+        tile_b = _make_tile((16, 16))
+        ctx.set_value("%a", tile_a)
+        ctx.set_value("%b", tile_b)
+        ctx._use_counts = {"%a": 1, "%b": 1}
+
+        assert ctx.lx.used == 1024
+        ctx.get_value("%a")
+        assert ctx.lx.used == 512
+        ctx.get_value("%b")
+        assert ctx.lx.used == 0
+        ctx.set_value("%r", _make_tile((16, 16)))
+        assert ctx.lx.used == 512
+
+    def test_net_accumulation_with_consume_off(self):
+        """With consume off: fetching does not free — lx stays at 1024 after both fetches."""
+        ctx = _make_context(lx_options=_LX_DEDUP)
+        tile_a = _make_tile((16, 16))  # 512 bytes
+        tile_b = _make_tile((16, 16))
+        ctx.set_value("%a", tile_a)
+        ctx.set_value("%b", tile_b)
+        ctx._use_counts = {"%a": 1, "%b": 1}
+
+        ctx.get_value("%a")
+        ctx.get_value("%b")
+        assert ctx.lx.used == 1024  # both still live
+
+
+class TestUseCountsParsed:
+    """_build_use_counts correctly counts operand occurrences across the whole function.
+
+    The use-count map is a flat dict: SSA name → number of times it appears
+    as an operand across all ops and nested regions.  A name with count == 1
+    is eligible for consume-on-last-use; count > 1 must never be consumed early.
+
+    Verified against MATMUL_UC_MLIR (8×8 tiles, one scf.for loop):
+
+        // function body
+        %accum_zero = arith.constant dense<0.0>            ← defined here
+        %c = scf.for ... iter_args(%accum_itr = %accum_zero) {
+            // loop body (nested region)
+            %c_init  = tensor.empty()                      ← defined here
+            %a_dot_b = linalg.matmul ... outs(%c_init)     ← %c_init used here (count=1)
+            %accum_next = arith.addf %accum_itr, %a_dot_b  ← %accum_itr used here (count=1)
+                                                           ← %a_dot_b used here (count=1)
+            scf.yield %accum_next
+        }                                                  ← %accum_zero used as iter_init (count=1)
+
+        // after loop
+        ktdp.store %c, %c_acc                              ← %pid_m used here
+
+        // %pid_m also appears inside the loop as index for %a_acc
+        // → two occurrences across function body + loop region → count >= 2
+
+    Name          Where used                         count   eligible?
+    ----------    --------------------------------   -----   ---------
+    %accum_zero   scf.for iter_init                    1     yes — freed when loop starts
+    %c_init       linalg.matmul outs                   1     yes — freed before %a_dot_b lands
+    %accum_itr    arith.addf operand                   1     yes (count) but blocked by
+                                                             topmost-scope guard at runtime
+    %pid_m        %a_acc index, %c_acc index            2     no  — must not be consumed early
+    """
+
+    def _get_use_counts(self):
+        from ktir_cpu.parser import KTIRParser
+        module = KTIRParser().parse_module(MATMUL_UC_MLIR)
+        return module.get_function("matmul_uc_test").use_counts
+
+    def test_gap1_accum_zero_single_use(self):
+        """%accum_zero appears once — as the iter_init of scf.for."""
+        uc = self._get_use_counts()
+        assert uc.get("%accum_zero", 0) == 1
+
+    def test_gap2_c_init_single_use(self):
+        """%c_init appears once — as the outs buffer of linalg.matmul."""
+        uc = self._get_use_counts()
+        assert uc.get("%c_init", 0) == 1
+
+    def test_gap3_accum_itr_single_use(self):
+        """%accum_itr appears once — as the left operand of arith.addf."""
+        uc = self._get_use_counts()
+        assert uc.get("%accum_itr", 0) == 1
+
+    def test_multi_use_names_not_single(self):
+        """%pid_m appears twice: once as index for %a_acc inside the loop, once for %c_acc after it."""
+        uc = self._get_use_counts()
+        assert uc.get("%pid_m", 0) >= 2, (
+            f"Expected %pid_m count >= 2, got {uc.get('%pid_m', 0)}"
+        )
+
+
+class TestLastUseMatmulKernel:
+    """End-to-end LX accounting for MATMUL_LX_MLIR (issue #130).
+
+    Kernel: BM=512, BN=256, BK=64, K=256 (4 iterations).
+    LX cap tightened to 1 MB = 1048576 bytes.
+
+    Tile sizes (f16 = 2 bytes/elem):
+        %accum_itr / %accum_next  512×256×2 = 262144 bytes  (256 KB)
+        %c_init / %a_dot_b        512×256×2 = 262144 bytes  (256 KB)
+        %a                        512×64×2  =  65536 bytes  ( 64 KB)
+        %b                         64×256×2 =  32768 bytes  ( 32 KB)
+
+    Per-iteration peak, _LX_DEDUP (consume off):
+        parent scope:  %accum_itr                    262144
+        body scope:    %a + %b + %c_init + %a_dot_b   65536+32768+262144+262144
+                       + %accum_next                 +262144
+                                                     -------
+        peak =  262144 + 65536 + 32768 + 262144 + 262144 + 262144 = 1146880 bytes
+        → exceeds 1 MB cap → MemoryError
+
+    Per-iteration peak, _LX_FULL (consume on), use_counts all 1:
+        parent: %accum_itr alive                      lx = 262144
+        body:
+          ktdp.load  → %a registered                  lx = 327680
+          ktdp.load  → %b registered                  lx = 360448
+          tensor.empty → %c_init registered            lx = 622592
+          linalg.matmul fetches %c_init (count=1, topmost) → freed
+                         %c_init consumed              lx = 360448
+                         %a_dot_b registered           lx = 622592
+          arith.addf fetches %a (count=1, topmost)   → freed
+                         %a consumed                   lx = 557056
+                     fetches %b (count=1, topmost)   → freed
+                         %b consumed                   lx = 524288
+                     fetches %accum_itr (count=1, but parent scope — guard blocks)
+                         %accum_itr stays              lx = 524288
+                     fetches %a_dot_b (count=1, topmost) → freed
+                         %a_dot_b consumed             lx = 262144
+                         %accum_next registered        lx = 524288
+        peak = 524288 bytes (512 KB) — within 1 MB cap → no overflow
+
+    Remaining limitation — simultaneous window for %accum_itr:
+        %accum_itr lives in the parent scope, not the body scope.
+        The topmost-scope guard blocks early-free even though use_count == 1,
+        because %accum_itr is fetched on every iteration (the global count
+        of 1 reflects that it appears once as an operand of arith.addf, but
+        that one appearance is executed K/BK times).
+        As a result, %accum_itr and %accum_next are both live simultaneously
+        inside each iteration body — hence peak = 2 × 256 KB = 512 KB
+        rather than the theoretical minimum of 256 KB.
+        The set_value rebind after each iteration frees %accum_itr promptly,
+        but cannot act before %accum_next is charged.
+    """
+
+    LX_CAP = 1 * 1024 * 1024  # 1 MB
+
+    def _run(self, lx_options):
+        from ktir_cpu.interpreter import KTIRInterpreter
+
+        class _PatchedInterpreter(KTIRInterpreter):
+            """Applies lx_options and LX cap after each _prepare_execution call."""
+            def _prepare_execution(self, grid_shape):
+                super()._prepare_execution(grid_shape)
+                for core in self.grid_executor.cores:
+                    core.lx.capacity = TestLastUseMatmulKernel.LX_CAP
+                    core.lx_options = lx_options
+
+        BM, BN, BK, K = 512, 256, 64, 256
+        a = np.random.rand(BM, K).astype(np.float16)
+        b = np.random.rand(K, BN).astype(np.float16)
+        c = np.zeros((BM, BN), dtype=np.float16)
+        interp = _PatchedInterpreter()
+        interp.load(MATMUL_LX_MLIR)
+        return interp.execute_function(
+            "matmul_lx_test", a_ptr=a, b_ptr=b, c_ptr=c,
+            K=K, BM=BM, BN=BN, BK=BK,
+        )
+
+    def test_fits_in_lx_with_consume_on(self):
+        """With consume_last_use on, peak LX stays within 1 MB — no overflow."""
+        self._run(_LX_FULL)  # must not raise
+
+    def test_overflows_lx_with_consume_off(self):
+        """With consume_last_use off, peak LX exceeds 1 MB — overflow expected."""
+        with pytest.raises(MemoryError, match="LX scratchpad overflow"):
+            self._run(_LX_DEDUP)
+
+    def test_addf_loop_body_lx_accounting(self):
+        """Unit: fetch two single-use tiles (lx → 0 each step), register result (lx = N)."""
+        N = 393216  # 384*512*2 bytes
+        ctx = _make_context(lx_options=_LX_FULL)
+        ctx.set_value("%accum_itr", _make_tile((384, 512)))
+        ctx.set_value("%a_dot_b",   _make_tile((384, 512)))
+        ctx._use_counts = {"%accum_itr": 1, "%a_dot_b": 1}
+
+        assert ctx.lx.used == N * 2
+        ctx.get_value("%accum_itr")
+        assert ctx.lx.used == N
+        ctx.get_value("%a_dot_b")
+        assert ctx.lx.used == 0
+        ctx.set_value("%accum_next", _make_tile((384, 512)))
+        assert ctx.lx.used == N
+

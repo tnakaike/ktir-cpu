@@ -168,6 +168,9 @@ class KTIRInterpreter:
                 # Scalar argument (like n)
                 input_ptrs[arg_name] = tensor
 
+        for core in self.grid_executor.cores:
+            core._use_counts = func.use_counts
+
         self.grid_executor.execute_with_communication(
             func.operations, input_ptrs, self._execute_op,
             transfer_backend=self.ring_backend,
@@ -205,7 +208,7 @@ class KTIRInterpreter:
             resolved_operands = []
             for name in op.operands:
                 try:
-                    resolved_operands.append(context.get_value(name))
+                    resolved_operands.append(context.get_value(name, peek=True))
                 except KeyError:
                     resolved_operands.append(None)
 
