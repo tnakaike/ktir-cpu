@@ -223,6 +223,21 @@ class KTIRInterpreter:
             print(f"Error executing {op.op_type} on core {context.core_id}: {e}")
             raise
 
+        # Structural invariant: accumulating ops must return the same outs object.
+        # Only applies to ops where result = f(ins) + outs (in-place accumulation).
+        if (op.outs_operands and not op.regions
+                and result is not None and not inspect.isgenerator(result)):
+            for outs_name in op.outs_operands:
+                try:
+                    outs_tile = context.get_value(outs_name, peek=True)
+                except KeyError:
+                    continue
+                if isinstance(outs_tile, Tile) and isinstance(result, Tile):
+                    assert id(result) == id(outs_tile), (
+                        f"{op.op_type}: handler returned new Tile instead of "
+                        f"mutating outs {outs_name!r}"
+                    )
+
         # Store result in context.
         # Only Tile values (tensor data backed by NumPy arrays) occupy LX.
         # Other result types — TileRef (metadata), AccessTile (coordinates),

@@ -133,6 +133,11 @@ class MLIRTypeAdapter:
             )
         handler(mlir_op, attributes, result_type, operands)
 
+        from ..dialects.registry import is_inplace_outs
+        from ..parser_utils import extract_outs_operands
+        outs_operands = (extract_outs_operands(mlir_op.get_asm())
+                         if is_inplace_outs(mlir_op.name) else [])
+
         return Operation(
             result=result,
             op_type=mlir_op.name,
@@ -140,6 +145,7 @@ class MLIRTypeAdapter:
             attributes=attributes,
             result_type=result_type,
             regions=regions,
+            outs_operands=outs_operands,
         )
 
     def adapt_block(self, block) -> List[Operation]:
@@ -158,8 +164,6 @@ MLIRTypeAdapter.install(
     "func.return",
     "linalg.add",
     "linalg.fill",
-    "linalg.matmul",
-    "linalg.batch_matmul",
     "linalg.yield",
     "scf.yield",
     "scf.if",
@@ -215,6 +219,8 @@ MLIRTypeAdapter.install(
     "ktdp.get_compute_tile_id",
     "ktdp.load",
     "ktdp.store",
+    "linalg.matmul",
+    "linalg.batch_matmul",
     # emitted by the bindings walk but not present in text IR
     "ktdp.region_terminator",
 )(_no_attrs)

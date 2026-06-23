@@ -30,6 +30,20 @@ def find_ssa_names(text: str) -> list[str]:
     return _SSA_RE.findall(text)
 
 
+_OUTS_RE = re.compile(r'\bouts\s*\(([^)]+)\)')
+
+
+def extract_outs_operands(op_text: str) -> list[str]:
+    """Extract SSA names from the ``outs(...)`` clause of a linalg op text."""
+    m = _OUTS_RE.search(op_text)
+    if not m:
+        return []
+    names = []
+    for segment in split_top_level(m.group(1)):
+        names.extend(find_ssa_names(segment.split(':')[0]))
+    return names
+
+
 def parse_multi_result_lhs(lhs_text: str) -> list[str]:
     """Parse the LHS of a multi-result MLIR assignment.
 

@@ -620,12 +620,17 @@ class KTIRParser(KTIRParserBase):
                 attributes["_result_shape"] = type_info["shape"]
                 attributes["_result_dtype"] = type_info.get("dtype", "f16")
 
+        from .parser_utils import extract_outs_operands
+        from .dialects.registry import is_inplace_outs
+        outs_ops = extract_outs_operands(rest) if is_inplace_outs(op_type) else []
+
         return Operation(
             result=result,
             op_type=op_type,
             operands=operands,
             attributes=attributes,
-            result_type=result_type
+            result_type=result_type,
+            outs_operands=outs_ops,
         )
 
     def _extract_operands(self, text: str, result: Optional[str]) -> List[str]:

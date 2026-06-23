@@ -297,7 +297,7 @@ def linalg__broadcast(op, context, env):
     return Tile(result, inp.dtype, out_shape)
 
 
-@register("linalg.matmul", latency_category=LC.COMPUTE_MATMUL)
+@register("linalg.matmul", latency_category=LC.COMPUTE_MATMUL, inplace_outs=True)
 def linalg__matmul(op, context, env):
     """Execute linalg.matmul: result = outs + ins[0] @ ins[1].
 
@@ -317,14 +317,18 @@ def linalg__matmul(op, context, env):
     tile_b = context.get_value(op.operands[1])  # ins[1] = B
     result = ArithOps.matmul(tile_a, tile_b)    # A @ B
     # Accumulate into outs (operands[2] = C) when present.
+    # In-place update: mirrors hardware behavior where the accumulator is a
+    # physical buffer written in-place. Returning the same Tile object means
+    # alias_dedup sees the same id() and doesn't double-charge LX.
     if len(op.operands) > 2:
         acc = context.get_value(op.operands[2])
         if isinstance(acc, Tile):
-            result = Tile(acc.data + result.data, acc.dtype, acc.shape)
+            acc.data += result.data
+            return acc
     return result
 
 
-@register("linalg.batch_matmul", latency_category=LC.COMPUTE_MATMUL)
+@register("linalg.batch_matmul", latency_category=LC.COMPUTE_MATMUL, inplace_outs=True)
 def linalg__batch_matmul(op, context, env):
     """Execute linalg.batch_matmul: result = outs + ins[0] @ ins[1] (batched).
 
@@ -342,7 +346,8 @@ def linalg__batch_matmul(op, context, env):
     if len(op.operands) > 2:
         acc = context.get_value(op.operands[2])
         if isinstance(acc, Tile):
-            result = Tile(acc.data + result.data, acc.dtype, acc.shape)
+            acc.data += result.data
+            return acc
     return result
 
 
