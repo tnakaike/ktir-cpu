@@ -104,6 +104,12 @@ class MLIRTypeAdapter:
 
     def adapt_op(self, mlir_op) -> Operation:
         """mlir.ir.Operation → ir_types.Operation."""
+        # Always read the op name via ``.operation.name``: when a dialect's
+        # Python bindings are packaged (e.g. func/arith), iterating operations
+        # yields the specific OpView subclass, and some subclasses (func.FuncOp)
+        # redefine ``.name`` to return the symbol name instead of the op name.
+        # ``.operation.name`` is invariant to which OpView wraps the op.
+        op_name = mlir_op.operation.name
         n_results = len(mlir_op.results)
         if n_results == 0:
             result = None
@@ -125,10 +131,10 @@ class MLIRTypeAdapter:
             for blk in region.blocks
         ]
 
-        handler = self._adapt_handlers.get(mlir_op.name)
+        handler = self._adapt_handlers.get(op_name)
         if handler is None:
             raise NotImplementedError(
-                f"No MLIRTypeAdapter handler registered for op '{mlir_op.name}'. "
+                f"No MLIRTypeAdapter handler registered for op '{op_name}'. "
                 "Add a @MLIRTypeAdapter.install(...) handler."
             )
         handler(mlir_op, attributes, result_type, operands)
@@ -137,7 +143,7 @@ class MLIRTypeAdapter:
         from ..parser_utils import extract_outs_operands, extract_bb0_arg_names
         op_asm = mlir_op.get_asm()
         outs_operands = (extract_outs_operands(op_asm)
-                         if is_inplace_outs(mlir_op.name) else [])
+                         if is_inplace_outs(op_name) else [])
         bb0_names = extract_bb0_arg_names(op_asm)
         if bb0_names and regions:
             regions[0].insert(0, Operation(
@@ -150,7 +156,7 @@ class MLIRTypeAdapter:
 
         return Operation(
             result=result,
-            op_type=mlir_op.name,
+            op_type=op_name,
             operands=operands,
             attributes=attributes,
             result_type=result_type,
@@ -463,7 +469,8 @@ def _adapt_linalg_reduce(mlir_op, attributes, result_type, operands):
     attributes["outs_var"] = operands[n_ins]
     del operands[n_ins:]  # drop outs — executor only uses ins operands
     body_ops = list(mlir_op.regions[0].blocks[0].operations)
-    attributes["reduce_fn"] = body_ops[0].name
+    # .operation.name (not .name): a packaged OpView may redefine .name.
+    attributes["reduce_fn"] = body_ops[0].operation.name
 
 
 @MLIRTypeAdapter.install("tensor.empty")
@@ -874,7 +881,7 @@ class MLIRFrontendParser(KTIRParserBase):
     def _build_ir_module(self, operations) -> IRModule:
         module = IRModule()
         for op, depth in operations:
-            if depth == 1 and op.name == "func.func":
+            if depth == 1 and op.operation.name == "func.func":
                 module.add_function(self._build_ir_function(op))
         return module
 
